@@ -442,6 +442,89 @@ SELECT create_distributed_table('test_dist', 'x');
 
 -- testing behaviour when setting shouldhaveshards to false on partially empty node
 SELECT * from master_set_node_property('localhost', :worker_2_port, 'shouldhaveshards', false);
+-- ================================================================
+-- Re-add node: groupId recovery tests
+-- ================================================================
+
+-- Test 1: re-adding the same primary node reuses its old groupId.
+--
+-- We manufacture the orphaned-group state by deleting the pg_dist_node row
+-- directly, the same technique used in the existing "no nodes in group"
+-- error coverage above.
+
+SET citus.shard_count TO 4;
+SET citus.shard_replication_factor TO 1;
+CREATE TABLE readd_node_test (id int, val text);
+SELECT create_distributed_table('readd_node_test', 'id');
+
+-- Record worker_2's current groupId.
+SELECT groupid AS w2_group FROM pg_dist_node
+WHERE nodeport = :worker_2_port \gset
+
+-- Confirm placements exist before we orphan the group.
+SELECT count(*) AS placement_count FROM pg_dist_placement
+WHERE groupid = :w2_group;
+
+-- Delete the node row on coordinator and all metadata workers.
+DELETE FROM pg_dist_node WHERE nodeport = :worker_2_port;
+SELECT run_command_on_workers(
+    format('DELETE FROM pg_dist_node WHERE nodeport = %s', :worker_2_port));
+
+-- Re-add via normal path. The probe reads worker_2's pg_dist_local_group,
+-- finds the groupId orphaned, and reuses it. A NOTICE is emitted.
+SELECT master_add_node('localhost', :worker_2_port) AS readded_nodeid \gset
+
+-- groupId must be the original, not a new sequence value.
+SELECT groupid = :w2_group AS groupid_recovered
+FROM pg_dist_node WHERE nodeid = :readded_nodeid;
+
+-- Distributed queries must succeed without any manual placement surgery.
+SELECT count(*) FROM readd_node_test;
+
+DROP TABLE readd_node_test;
+
+
+-- Test 2: unreachable worker falls back to a fresh groupId.
+--
+-- citus_add_inactive_node does not activate the node, so no reference-table
+-- replication is attempted and the missing listener does not cause a failure.
+-- Our probe gets connection-refused, FlushErrorState() is called, and
+-- GetNextGroupId() is used instead.
+
+SELECT master_add_inactive_node('localhost', :worker_2_port + 10)
+AS unreachable_nodeid \gset
+
+-- The fresh groupId must have no placements.
+SELECT count(*) = 0 AS fresh_groupid_has_no_placements
+FROM pg_dist_placement
+WHERE groupid = (
+    SELECT groupid FROM pg_dist_node WHERE nodeid = :unreachable_nodeid);
+
+SELECT master_remove_node('localhost', :worker_2_port + 10);
+
+
+-- Test 3: secondary node bypasses recovery.
+--
+-- citus_add_secondary_node sets nodeMetadata.groupId = GroupForNode(...)
+-- before calling AddNodeMetadata(), so nodeMetadata->groupId is not
+-- INVALID_GROUP_ID when AddNodeMetadata() is entered. The recovery block
+-- is skipped entirely.
+-- Port :worker_2_port + 2 follows the same unused-port convention used
+-- for secondary slots elsewhere in this file.
+
+SELECT master_add_secondary_node('localhost', :worker_2_port + 2,
+                                  'localhost', :worker_1_port)
+AS secondary_nodeid \gset
+
+-- Secondary must share worker_1's groupId exactly.
+SELECT (SELECT groupid FROM pg_dist_node WHERE nodeid = :secondary_nodeid) =
+       (SELECT groupid FROM pg_dist_node WHERE nodeport = :worker_1_port)
+AS secondary_has_primary_groupid;
+
+SELECT master_remove_node('localhost', :worker_2_port + 2);
+
+-- Re-activate worker_2 so subsequent tests see a normal two-worker cluster.
+SELECT citus_activate_node('localhost', :worker_2_port);
 CREATE TABLE test_dist_colocated (x int, y int);
 CREATE TABLE test_dist_non_colocated (x int, y int);
 CREATE TABLE test_dist_colocated_with_non_colocated (x int, y int);
