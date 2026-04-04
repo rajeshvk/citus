@@ -142,6 +142,8 @@ static void EnsureTransactionalMetadataSyncMode(void);
 static BackgroundWorkerHandle * CheckBackgroundWorkerToObtainLocks(int32 lock_cooldown);
 static BackgroundWorkerHandle * LockPlacementsWithBackgroundWorkersInPrimaryNode(
 	WorkerNode *workerNode, bool force, int32 lock_cooldown);
+static int32 TryRecoverOrphanedGroupIdForNode(const char *nodeName, int32 nodePort);
+static bool NodeGroupExistsInMetadata(int32 groupId);
 
 
 static int32 CitusAddCloneNode(WorkerNode *primaryWorkerNode,
@@ -2576,9 +2578,48 @@ AddNodeMetadata(char *nodeName, int32 nodePort, NodeMetadata *nodeMetadata,
 	}
 
 	/* user lets Citus to decide on the group that the newly added node should be in */
-	if (nodeMetadata->groupId == INVALID_GROUP_ID)
+if (nodeMetadata->groupId == INVALID_GROUP_ID)
 	{
-		nodeMetadata->groupId = GetNextGroupId();
+		/*
+		 * For primary nodes added without an explicit groupId, probe the
+		 * target worker for its remembered groupId from pg_dist_local_group.
+		 * If that groupId is currently orphaned on the coordinator (no row
+		 * in pg_dist_node claims it) and still has placement rows referencing
+		 * it, reuse it so those placements remain valid without manual repair.
+		 *
+		 * Secondaries always arrive here with nodeMetadata->groupId already
+		 * set to GroupForNode(...) by citus_add_secondary_node(), so they
+		 * never enter this branch. The coordinator uses groupId = 0 set
+		 * explicitly before AddNodeMetadata() is called.
+		 *
+		 * When PrimaryNodeRoleId() returns InvalidOid (early bootstrap or
+		 * the 3-argument test form of citus_add_node), both sides of the
+		 * comparison are InvalidOid, so recovery fires — consistent with
+		 * NodeIsPrimary() treating InvalidOid nodes as primaries.
+		 */
+		int32 recoveredGroupId = INVALID_GROUP_ID;
+
+		if (nodeMetadata->nodeRole == PrimaryNodeRoleId())
+		{
+			recoveredGroupId = TryRecoverOrphanedGroupIdForNode(nodeName, nodePort);
+		}
+
+		if (recoveredGroupId != INVALID_GROUP_ID)
+		{
+			nodeMetadata->groupId = recoveredGroupId;
+			ereport(NOTICE,
+					(errmsg("re-adding node \"%s:%d\": reusing existing node "
+							"group %d from previous registration",
+							nodeName, nodePort, recoveredGroupId),
+					 errdetail("The node was previously removed but its shard "
+							   "placements are still recorded on the coordinator. "
+							   "The old group id has been reused so those "
+							   "placements remain valid.")));
+		}
+		else
+		{
+			nodeMetadata->groupId = GetNextGroupId();
+		}
 	}
 
 	if (nodeMetadata->groupId == COORDINATOR_GROUP_ID)
@@ -3069,6 +3110,128 @@ GetNodeByNodeId(int32 nodeId)
 	return nodeTuple;
 }
 
+/*
+ * TryRecoverOrphanedGroupIdForNode
+ *
+ * Opens a single-use connection to the target worker and reads its remembered
+ * groupId from pg_dist_local_group. Returns that groupId only when all four
+ * conditions hold:
+ *
+ *   1. The worker is reachable and the query succeeds.
+ *   2. The returned groupId is not INVALID_GROUP_ID (-1) or
+ *      COORDINATOR_GROUP_ID (0).
+ *   3. No row in pg_dist_node currently claims that groupId (the group is
+ *      orphaned on the coordinator).
+ *   4. At least one row in pg_dist_placement still references that groupId.
+ *
+ * Any error during the probe — connection refused, timeout, bad value,
+ * any ereport — is caught and converted to INVALID_GROUP_ID. The caller
+ * then falls back to GetNextGroupId() as before.
+ */
+static int32
+TryRecoverOrphanedGroupIdForNode(const char *nodeName, int32 nodePort)
+{
+	int32		recoveredGroupId = INVALID_GROUP_ID;
+	int			connectionFlags = FORCE_NEW_CONNECTION;
+	MultiConnection *connection = NULL;
+	PGresult   *result = NULL;
+
+	PG_TRY();
+	{
+		connection = GetNodeConnection(connectionFlags, nodeName, nodePort);
+
+		if (connection != NULL && PQstatus(connection->pgConn) == CONNECTION_OK)
+		{
+			int queryResult = ExecuteOptionalRemoteCommand(
+				connection,
+				"SELECT groupid FROM pg_dist_local_group LIMIT 1",
+				&result);
+
+			/*
+			 * ExecuteOptionalRemoteCommand returns 0 on success. Any other
+			 * value means the query failed or the connection dropped.
+			 */
+			if (queryResult == 0 &&
+				result != NULL &&
+				PQntuples(result) == 1 &&
+				!PQgetisnull(result, 0, 0))
+			{
+				int32 workerGroupId = pg_atoi(PQgetvalue(result, 0, 0),
+											  sizeof(int32), '\0');
+
+				if (workerGroupId != INVALID_GROUP_ID &&
+					workerGroupId != COORDINATOR_GROUP_ID &&
+					!NodeGroupExistsInMetadata(workerGroupId) &&
+					NodeGroupHasShardPlacements(workerGroupId, false))
+				{
+					recoveredGroupId = workerGroupId;
+				}
+			}
+
+			if (result != NULL)
+			{
+				PQclear(result);
+				result = NULL;
+			}
+		}
+
+		if (connection != NULL)
+		{
+			CloseConnection(connection);
+			connection = NULL;
+		}
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Swallow all errors. FlushErrorState() clears the error context
+		 * after catching an ERROR-level ereport — required before normal
+		 * execution can continue.
+		 *
+		 * We do not call CloseConnection() here: if the error came from
+		 * inside the connection machinery a second call risks another error.
+		 * The connection was opened with FORCE_NEW_CONNECTION so it is not
+		 * in the shared pool and will be freed at end of transaction.
+		 */
+		FlushErrorState();
+		recoveredGroupId = INVALID_GROUP_ID;
+	}
+	PG_END_TRY();
+
+	return recoveredGroupId;
+}
+
+
+/*
+ * NodeGroupExistsInMetadata
+ *
+ * Returns true iff the worker-node hash contains at least one node —
+ * primary or secondary — with the given groupId. Iterates the hash
+ * directly so the check is unambiguously "any node in group", not
+ * "primary node in group".
+ *
+ * The worker-node hash reflects committed state of pg_dist_node.
+ * A node deleted in a previous transaction will not appear here, so a
+ * recently-removed node's groupId correctly returns false.
+ */
+static bool
+NodeGroupExistsInMetadata(int32 groupId)
+{
+	WorkerNode	   *workerNode = NULL;
+	HASH_SEQ_STATUS	status;
+	HTAB		   *workerNodeHash = GetWorkerNodeHash();
+
+	hash_seq_init(&status, workerNodeHash);
+	while ((workerNode = hash_seq_search(&status)) != NULL)
+	{
+		if (workerNode->groupId == groupId)
+		{
+			hash_seq_term(&status);
+			return true;
+		}
+	}
+	return false;
+}
 
 /*
  * GetNextGroupId allocates and returns a unique groupId for the group
